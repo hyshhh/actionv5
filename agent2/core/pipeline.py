@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Callable
 
 import cv2
@@ -20,6 +22,7 @@ from models.schemas import (
     PersonDetection,
     BehaviorResult,
     AnalysisReport,
+    Severity,
 )
 from utils.image_utils import draw_detections, save_image, pad_bbox, crop_region, encode_image_to_base64
 from utils.logger import get_logger
@@ -158,6 +161,7 @@ class Pipeline:
         camera_interval: float = 0.1,
         alert_cooldown: int = 30,
         sustained_detection_frames: int = 1,
+        max_concurrent: int = 1,
         output_dir: str = "output",
         save_annotated: bool = True,
         save_crops: bool = True,
@@ -180,6 +184,7 @@ class Pipeline:
             camera_interval: 摄像头调用间隔（秒）
             alert_cooldown: 同一行为告警冷却秒数
             sustained_detection_frames: 连续N帧检测到目标才触发API（需求3）
+            max_concurrent: 最大并发 API 请求数（≥2 时启用并发模式）
             output_dir: 输出目录
             save_annotated: 是否保存标注帧
             save_crops: 是否保存人体裁剪图
@@ -200,6 +205,7 @@ class Pipeline:
         self.camera_interval = camera_interval
         self.alert_cooldown = alert_cooldown
         self.sustained_detection_frames = max(1, sustained_detection_frames)
+        self.max_concurrent = max(1, max_concurrent)
         self.output_dir = output_dir
         self.save_annotated = save_annotated
         self.save_crops = save_crops
@@ -207,6 +213,14 @@ class Pipeline:
         self.display = display
         self.display_scale = display_scale
         self.alert_callback = alert_callback
+
+        # 并发线程池（max_concurrent ≥ 2 时启用并发）
+        self._executor: Optional[ThreadPoolExecutor] = None
+        if self.max_concurrent >= 2:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.max_concurrent,
+                thread_name_prefix="classify",
+            )
 
         # 追踪模式判断
         self.tracking_enabled = getattr(detector, 'tracker_enabled', False)
@@ -276,6 +290,7 @@ class Pipeline:
         logger.info(f"  追踪模式: {'启用' if self.tracking_enabled else '禁用'}")
         logger.info(f"  持续帧阈值: {self.sustained_detection_frames} 帧")
         logger.info(f"  处理间隔: 每 {self.process_interval} 帧")
+        logger.info(f"  最大并发: {self.max_concurrent} ({'并发模式' if self._executor else '串行模式'})")
         if self.tracking_enabled:
             logger.info(f"  缓冲区大小: {self.buffer_size} 帧")
         else:
@@ -383,6 +398,80 @@ class Pipeline:
                     except Exception as log_error:
                         logger.error(f"保存摄像头日志失败: {log_error}")
 
+    def _classify_concurrent(
+        self,
+        tasks: list[tuple[int, list[str]]],
+    ) -> list[tuple[int, BehaviorResult]]:
+        """
+        并发调用行为分类器，结果严格按输入顺序返回。
+
+        当 max_concurrent >= 2 时，使用 ThreadPoolExecutor 并发提交 API 请求；
+        当 max_concurrent == 1 时，退化为串行模式，行为与原版完全一致。
+
+        并发机制：
+        - 使用 Semaphore 限制最大并发数，防止 API 限流
+        - 每个任务独立提交到线程池，互不阻塞
+        - 通过 dict 按原始 index 收集结果，确保顺序一一对应
+
+        Args:
+            tasks: [(person_key, [base64_frames, ...]), ...] 待分类任务列表
+                   顺序决定了最终结果的顺序
+
+        Returns:
+            [(person_key, BehaviorResult), ...] 与输入 tasks 严格对应的结果列表
+        """
+        if not tasks:
+            return []
+
+        # 串行模式：max_concurrent <= 1
+        if self._executor is None:
+            results = []
+            for person_key, keyframes_b64 in tasks:
+                result = self.classifier.classify(keyframes_b64)
+                results.append((person_key, result))
+            return results
+
+        # 并发模式
+        semaphore = threading.Semaphore(self.max_concurrent)
+        futures_map = {}
+
+        def _call_with_semaphore(keyframes: list[str]) -> BehaviorResult:
+            """带信号量控制的分类调用"""
+            semaphore.acquire()
+            try:
+                return self.classifier.classify(keyframes)
+            finally:
+                semaphore.release()
+
+        # 并发提交所有任务（保持原始顺序的 index 映射）
+        for idx, (person_key, keyframes_b64) in enumerate(tasks):
+            future = self._executor.submit(_call_with_semaphore, keyframes_b64)
+            futures_map[future] = (idx, person_key)
+
+        # 按原始 index 收集结果，确保顺序严格对应
+        indexed_results: dict[int, tuple[int, BehaviorResult]] = {}
+        for future in as_completed(futures_map):
+            idx, person_key = futures_map[future]
+            try:
+                result = future.result()
+                indexed_results[idx] = (person_key, result)
+            except Exception as e:
+                logger.error(f"并发分类失败 (person_key={person_key}): {e}")
+                indexed_results[idx] = (person_key, BehaviorResult(
+                    behavior_id="unknown",
+                    behavior_label="未知",
+                    description=f"并发分类异常: {str(e)}",
+                    severity=Severity.NORMAL,
+                ))
+
+        # 按原始 index 排序，保证输出顺序与输入一致
+        ordered_results = [
+            indexed_results[i]
+            for i in sorted(indexed_results.keys())
+        ]
+
+        return ordered_results
+
     def _analyze_single_frame(
         self,
         frame: np.ndarray,
@@ -394,6 +483,11 @@ class Pipeline:
 
         不依赖帧缓冲区，仅对当前帧中的人物逐个裁剪并调用模型分析。
         每个人物用 list index 作为标识（无 track_id）。
+
+        采用三阶段处理：
+        1. 准备阶段：为每个检测结果裁剪人体区域并编码为 base64
+        2. 并发阶段：将所有分类任务并发提交到线程池（受 max_concurrent 限制）
+        3. 后处理阶段：按原始顺序收集结果，执行告警、日志等后续逻辑
 
         Args:
             frame: 当前帧
@@ -417,13 +511,13 @@ class Pipeline:
             detections=detections,
         )
 
-        tagged_behaviors: list[tuple[int, BehaviorResult]] = []
+        # ===== 阶段1：准备 — 裁剪所有人像区域，构建分类任务 =====
+        classify_tasks: list[tuple[int, list[str]]] = []
+        crop_cache: dict[int, np.ndarray] = {}  # person_key → crop_image
 
         for det_idx, det in enumerate(detections):
-            # 无追踪模式：使用 list index 作为 person_key
-            person_key = det_idx
+            person_key = det_idx  # 无追踪模式：使用 list index
 
-            # 对当前帧中该人物裁剪一次（分类和保存共用）
             bw = det.bbox.x2 - det.bbox.x1
             bh = det.bbox.y2 - det.bbox.y1
             pad_ratio = self.extractor._get_padding(bw, bh, w, h)
@@ -436,20 +530,29 @@ class Pipeline:
                 continue
 
             crop_b64 = encode_image_to_base64(crop, fmt=".jpg", quality=80)
+            classify_tasks.append((person_key, [crop_b64]))
+            crop_cache[person_key] = crop
 
-            # 单帧调用分类器
-            result = self.classifier.classify([crop_b64])
-            tagged_behaviors.append((person_key, result))
+        if not classify_tasks:
+            return analysis
 
+        # ===== 阶段2：并发分类 =====
+        tagged_behaviors = self._classify_concurrent(classify_tasks)
+
+        # ===== 阶段3：后处理 — 按原始顺序执行告警、日志等 =====
+        for person_key, result in tagged_behaviors:
             logger.info(
                 f"[帧 {frame_index}] 人物#{person_key}: "
                 f"{result.behavior_label} ({result.behavior_id}) "
                 f"[{result.severity.value}]"
             )
 
-            # 保存裁剪图（复用已裁好的 crop，不再重复裁剪）
-            if self.save_crops:
-                self._save_crop(frame, det, frame_index, person_key, crop_image=crop)
+            # 保存裁剪图（复用已缓存的 crop）
+            det_idx = person_key
+            if det_idx < len(detections) and self.save_crops:
+                crop_img = crop_cache.get(person_key)
+                if crop_img is not None:
+                    self._save_crop(frame, detections[det_idx], frame_index, person_key, crop_image=crop_img)
 
             # 告警处理
             if result.is_alert():
@@ -494,6 +597,11 @@ class Pipeline:
 
         基于滑动窗口缓冲区（buffer_size 控制历史范围）为每个人物提取关键帧并调用模型分析。
         以 last_detections 顺序为基准，确保 behaviors 与 detections 一一对应。
+
+        采用三阶段处理：
+        1. 准备阶段：提取每个人物的关键帧，构建分类任务
+        2. 并发阶段：将所有分类任务并发提交到线程池（受 max_concurrent 限制）
+        3. 后处理阶段：按原始顺序收集结果，执行告警、日志等后续逻辑
         """
         if not self._frame_buffer:
             return None
@@ -516,29 +624,37 @@ class Pipeline:
             tracker_enabled=self.tracking_enabled,
         )
 
-        # ---- 以 last_detections 顺序为基准，逐人分析 ----
-        # 用 (person_key, result) 二元组，确保每个 behavior 都带有明确归属
-        tagged_behaviors: list[tuple[int, BehaviorResult]] = []
         has_tracking = self.tracking_enabled and any(
             d.track_id is not None for d in last_detections
         )
 
+        # ===== 阶段1：准备 — 构建分类任务列表 =====
+        classify_tasks: list[tuple[int, list[str]]] = []
+        task_det_map: dict[int, int] = {}  # task_index → detection_index（用于保存裁剪图）
+
         for det_idx, det in enumerate(last_detections):
-            # 确定该 detection 对应的 person_key
             if has_tracking:
                 person_key = det.track_id
             else:
                 person_key = det_idx
 
-            # 查找该人物的关键帧
             keyframes_b64 = person_keyframes.get(person_key)
             if not keyframes_b64:
                 continue
 
-            # 调用千问模型
-            result = self.classifier.classify(keyframes_b64)
-            tagged_behaviors.append((person_key, result))
+            task_idx = len(classify_tasks)
+            classify_tasks.append((person_key, keyframes_b64))
+            task_det_map[task_idx] = det_idx
 
+        if not classify_tasks:
+            return analysis
+
+        # ===== 阶段2：并发分类 =====
+        tagged_behaviors = self._classify_concurrent(classify_tasks)
+
+        # ===== 阶段3：后处理 — 按原始顺序执行告警、日志等 =====
+        for task_idx, (person_key, result) in enumerate(tagged_behaviors):
+            det_idx = task_det_map.get(task_idx, task_idx)
             person_label = f"track#{person_key}" if has_tracking else f"#{person_key}"
 
             logger.info(
@@ -548,8 +664,8 @@ class Pipeline:
             )
 
             # 保存裁剪图
-            if self.save_crops:
-                self._save_crop(frame, det, frame_index, person_key)
+            if self.save_crops and det_idx < len(last_detections):
+                self._save_crop(frame, last_detections[det_idx], frame_index, person_key)
 
             # 告警处理
             if result.is_alert():
@@ -704,6 +820,15 @@ class Pipeline:
         """流水线结束，保存报告"""
         self._report.end_time = time.time()
         self._report.processed_frames = self._processed_count
+
+        # 关闭并发线程池
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                # Python < 3.9 不支持 cancel_futures 参数
+                self._executor.shutdown(wait=True)
+            logger.info("并发线程池已关闭")
 
         # 需求2：保存摄像头行为日志（在释放视频源之前保存）
         if self._camera_log is not None:

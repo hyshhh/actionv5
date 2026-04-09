@@ -150,6 +150,7 @@ def build_pipeline(args: argparse.Namespace, config: dict) -> Pipeline:
         camera_interval=pp_cfg.get("camera_interval", 0.1),
         alert_cooldown=pp_cfg.get("alert_cooldown", 30),
         sustained_detection_frames=pp_cfg.get("sustained_detection_frames", 1),  # 需求3
+        max_concurrent=pp_cfg.get("max_concurrent", 1),  # 最大并发 API 请求数
         output_dir=output_dir,
         save_annotated=out_cfg.get("save_annotated", True),
         save_crops=out_cfg.get("save_crops", True),
@@ -271,6 +272,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=None,
+        help="最大并发 API 请求数 (默认: 读取 config.yaml 中的 max_concurrent)",
+    )
+
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="详细日志输出",
@@ -295,6 +303,8 @@ def main():
         config.setdefault("pipeline", {})["camera_interval"] = args.camera_interval
     if args.display_scale:
         config.setdefault("pipeline", {})["display_scale"] = args.display_scale
+    if args.max_concurrent is not None:
+        config.setdefault("pipeline", {})["max_concurrent"] = max(1, args.max_concurrent)
 
     # 设置 API Key（命令行优先，其次环境变量）
     if args.api_key:
