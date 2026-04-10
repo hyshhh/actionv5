@@ -1,12 +1,87 @@
-# agent
+# 水上行为识别系统
 
-水上行为识别系统 — 基于 YOLOv8 + 多模态大模型的实时行为分析
+基于 YOLO + 多模态大模型的实时行为分析系统
 
-## 快速开始
+## 环境准备
 
 ```bash
-cd agent2
-pip install -r requirements.txt  # 如有
+pip install -r requirements.txt
+```
+
+## 下载开源模型
+
+> 需要查看 [vLLM 官方支持的模型列表](https://docs.vllm.com.cn/en/latest/usage/)
+
+```bash
+# 1. Qwen3-VL-4B-Instruct (FP16)
+pip install modelscope
+modelscope download --model Qwen/Qwen3-VL-4B-Instruct --local_dir /media/ddc/新加卷/hys/qmy/qwen
+
+# 2. Qwen3-VL-4B-Instruct-AWQ-4bit (INT4 量化版)
+python -c "
+from modelscope import snapshot_download
+snapshot_download('cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit', local_dir='/media/ddc/新加卷/hys/hysnew/Qwen3-VL-4B-Instruct-AWQ-4bit')
+"
+
+# 3. Qwen3.5-2B (FP16)
+modelscope download --model Qwen/Qwen3.5-2B --local_dir /media/ddc/新加卷/hys/hysnew/Qwen/Qwen3.5-2B
+
+# 4. Qwen3.5-2B-AWQ-4bit (INT4 量化版)
+modelscope download --model cyankiwi/Qwen3.5-2B-AWQ-4bit --local_dir /media/ddc/新加卷/hys/hysnew/Qwen3.5-2B-AWQ
+
+# 5. Qwen3.5-0.8B (轻量版)
+modelscope download --model unsloth/Qwen3.5-0.8B --local_dir /media/ddc/新加卷/hys/hysnew/Qwen3.5-0.8B
+```
+
+## 启动 vLLM 推理服务
+
+> 注意 `--api-key` 和 `--served-model-name` 要和 `config.yaml` 中保持一致
+
+```bash
+# 1. Qwen3-VL-4B-Instruct (FP16)
+CUDA_VISIBLE_DEVICES=1 vllm serve /media/ddc/新加卷/hys/qmy/qwen \
+  --api-key abc123 \
+  --served-model-name Qwen/Qwen3-VL-4B-Instruct \
+  --max-model-len 1024 \
+  --port 7890 \
+  --gpu-memory-utilization 0.25
+
+# 2. Qwen3-VL-4B-Instruct-AWQ-4bit (INT4)
+CUDA_VISIBLE_DEVICES=1 vllm serve /media/ddc/新加卷/hys/hysnew/Qwen3-VL-4B-Instruct-AWQ-4bit \
+  --api-key abc123 \
+  --served-model-name Qwen/Qwen3-VL-4B-AWQ \
+  --max-model-len 1024 \
+  --port 7890 \
+  --gpu-memory-utilization 0.25
+
+# 3. Qwen3.5-2B (FP16)
+CUDA_VISIBLE_DEVICES=1 vllm serve /media/ddc/新加卷/hys/hysnew/Qwen/Qwen3.5-2B \
+  --api-key abc123 \
+  --served-model-name Qwen/Qwen3-VL-4B-AWQ \
+  --max-model-len 1024 \
+  --port 7890 \
+  --gpu-memory-utilization 0.25
+
+# 4. Qwen3.5-2B-AWQ-4bit (INT4)
+CUDA_VISIBLE_DEVICES=1 vllm serve /media/ddc/新加卷/hys/hysnew/Qwen3.5-2B-AWQ \
+  --api-key abc123 \
+  --served-model-name Qwen/Qwen3-VL-4B-AWQ \
+  --max-model-len 1024 \
+  --port 7890 \
+  --gpu-memory-utilization 0.15 \
+  --max-num-seqs 10
+
+# 5. Qwen3.5-0.8B (轻量版)
+CUDA_VISIBLE_DEVICES=1 VLLM_USE_MODELSCOPE=true vllm serve /media/ddc/新加卷/hys/hysnew/Qwen3.5-0.8B \
+  --port 8000 \
+  --tensor-parallel-size 1 \
+  --max-model-len 1024 \
+  --trust-remote-code
+```
+
+## 运行
+
+```bash
 python main.py --config config.yaml
 ```
 
@@ -15,141 +90,103 @@ python main.py --config config.yaml
 ### 模型运行模式
 
 ```yaml
-model_mode: "api"    # "api" = 阿里云百炼千问 | "local" = 本地 vLLM
+model_mode: "local"    # "api" = 阿里云百炼千问 | "local" = 本地 vLLM
 ```
 
 ### 检测器 (detector)
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `model` | `yolov8n.pt` | YOLOv8 模型路径，首次运行自动下载 |
-| `confidence` | `0.5` | 检测置信度阈值，低于此值的框直接丢弃 |
-| `device` | `cpu` | 推理设备：`cpu` / `cuda:0` |
-| `class_id` | `0` | COCO 数据集类别 ID，`0` = person |
-| `detect_width` | `0` | 推理宽度，`0` = 保持原始分辨率 |
-| `detect_height` | `0` | 推理高度，`0` = 保持原始分辨率 |
-| `nms_iou` | `0.5` | NMS IoU 阈值，控制合并重叠框的严格程度 |
+| `model` | `yolo11n.pt` | YOLO 模型路径，首次运行自动下载 |
+| `confidence` | `0.1` | 检测置信度阈值，低于此值的框直接丢弃 |
+| `device` | `cuda:0` | 推理设备：`cpu` / `cuda:0` |
+| `class_ids` | `[0, 1, 2]` | 要检测的类别 ID 列表，全部当作"人"处理 |
+| `detect_width` | `640` | 推理宽度，`0` = 保持原始分辨率 |
+| `detect_height` | `640` | 推理高度，`0` = 保持原始分辨率 |
+| `nms_iou` | `0.1` | NMS IoU 阈值，控制合并重叠框的严格程度 |
 
-**`nms_iou` 调参指南：**
-- `0.1` — 极严格，IoU > 0.1 的重叠框全部合并（可能导致站得近的两个人被合并）
-- `0.3~0.5` — 推荐范围
-- `0.7` — 很宽松，几乎不合并（同一个人可能保留多个框）
-
-**`confidence` 与 `track_low_thresh` 的关系：**
-```
-detector.confidence ≤ tracker.track_low_thresh
-
-如果 confidence > track_low_thresh：
-  → 低分框根本没进 tracker，第二阶段匹配失效
-```
+**`class_ids` 说明：**
+- 支持单个值（如 `0`）或列表（如 `[0, 1, 2]`）
+- 列表中所有类别统一当作"人"处理，合并输出
 
 ### 跟踪器 (tracker)
 
 ```yaml
 tracker:
-  enabled: true               # true = 启用跟踪 | false = 仅检测（无ID）
-  tracker_type: "bytetrack"   # "bytetrack" | "botsort"
+  enabled: false               # true = 启用跟踪 | false = 仅检测（无ID）
+  tracker_type: "bytetrack"    # "bytetrack" | "botsort"
 ```
-
-**三种模式：**
-
-| 模式 | 配置 | 效果 |
-|------|------|------|
-| 不使用跟踪 | `enabled: false` | 每帧独立检测，无 track_id，无行为连续性 |
-| ByteTrack | `enabled: true`, `tracker_type: "bytetrack"` | 纯 IoU 匹配，速度快 |
-| BoT-SORT | `enabled: true`, `tracker_type: "botsort"` | IoU + 运动 + 可选外观特征 |
-
-#### 通用参数（bytetrack / botsort 共用）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `track_high_thresh` | `0.5` | 高分框门槛。conf ≥ 此值的框参与第1轮匹配 |
-| `track_low_thresh` | `0.1` | 低分框门槛。conf 在 [low, high) 之间参与第2轮匹配 |
-| `match_thresh` | `0.8` | IoU 匹配阈值，IoU > 此值才算"同一个人" |
-| `track_buffer` | `30` | 跟踪丢失后保留帧数，超过此帧数才释放 ID |
+| `track_high_thresh` | `0.6` | 高分框门槛 |
+| `track_low_thresh` | `0.3` | 低分框门槛（ByteTrack 二次匹配） |
+| `match_thresh` | `0.8` | IoU 匹配阈值 |
+| `track_buffer` | `30` | 跟踪丢失后保留帧数 |
+| `with_reid` | `false` | BoT-SORT 是否启用 ReID 外观特征 |
 
-**`track_high_thresh` / `track_low_thresh` 两阶段匹配原理：**
+### 关键帧提取 (frame_extractor)
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `padding_ratio` | `0.15` | 裁剪 padding 倍率 |
+| `keyframe_interval` | `1` | 每隔几帧提取一帧 |
+| `keyframe_count` | `1` | 关键帧数量上限 |
+| `min_region_size` | `32` | 最小有效区域像素 |
+| `adaptive_padding` | `true` | 小目标自动放大 padding |
+| `pixel_threshold` | `20000` | 最小裁剪面积阈值（像素²） |
+
+### 行为类别
+
+| ID | 中文 | 英文 | 严重等级 |
+|----|------|------|---------|
+| 0 | 溺水 | drowning | critical |
+| 1 | 游泳 | swimming | normal |
+| 2 | 攀爬栏杆 | climbing | warning |
+| 3 | 正常行走 | normal_walking | normal |
+| 4 | 正在救援 | waterhelping | normal |
+| 5 | 在船上 | abord | normal |
+
+### 流水线 (pipeline)
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `process_every_n_frames` | `1` | 每 N 帧触发一次推理 |
+| `max_concurrent` | `5` | 最大并发 API 请求数 |
+| `alert_cooldown` | `5` | 同一行为告警冷却（秒） |
+| `display` | `true` | 是否显示实时画面 |
+| `sustained_detection_frames` | `1` | 连续 N 帧检测到目标才触发 |
+
+## 项目结构
+
 ```
-当前帧所有检测框
-    │
-    ├─ conf ≥ track_high_thresh      → 第1轮：和已有轨迹匹配（高分框）
-    │
-    ├─ track_low_thresh ≤ conf < high → 第2轮：补充匹配（低分框）
-    │
-    └─ conf < track_low_thresh        → 丢弃
-```
-
-**`match_thresh` 调参指南：**
-- `0.01~0.05` — 极宽松，相邻的人容易被合并成同一个 ID
-- `0.3~0.5` — 推荐范围
-- `0.8+` — 极严格，框稍微偏移就匹配失败，频繁分配新 ID
-
-**`track_buffer` 调参指南：**
-- `5` — 约 0.17 秒（30fps），被遮挡瞬间就丢 ID
-- `30` — 约 1 秒，推荐值
-- `60+` — 适合长时间遮挡场景
-
-#### BoT-SORT 专有参数
-
-```yaml
-with_reid: false    # 是否启用 ReID 外观特征匹配
-```
-
-| 值 | 效果 |
-|----|------|
-| `false` | 纯运动 + IoU 匹配，不额外下载模型，速度快 |
-| `true` | 启用 ReID，靠外观特征找回被遮挡目标，需要额外 GPU 显存 |
-
-### 参数之间的依赖关系
-
-```
-detector.confidence ──→ 必须 ≤ tracker.track_low_thresh
-
-detector.nms_iou    ──→ YOLO 内部 NMS，过滤重叠框
-                         太小：误合并不同人
-                         太大：同人多框，tracker 给每个框分配独立 ID
-
-tracker.match_thresh ──→ 框与轨迹的 IoU 匹配门槛
-                          太小：不同人被合并
-                          太大：频繁换 ID
-
-tracker.track_buffer ──→ 丢帧容忍度
-                          太小：遮挡后换 ID
-                          太大：真换人后旧 ID 久不释放
-```
-
-### 推荐配置
-
-**高精度场景（泳池/仓库监控）：**
-```yaml
-detector:
-  confidence: 0.3
-  nms_iou: 0.3
-tracker:
-  enabled: true
-  tracker_type: "bytetrack"
-  track_high_thresh: 0.6
-  track_low_thresh: 0.3
-  match_thresh: 0.4
-  track_buffer: 30
+.
+├── main.py                    # 入口
+├── config.yaml                # 全局配置
+├── core/
+│   ├── detector.py            # YOLO 人体检测 + ByteTrack 跟踪
+│   ├── pipeline.py            # 推理流水线
+│   ├── behavior_classifier.py # 行为分类器
+│   ├── frame_extractor.py     # 关键帧提取
+│   └── video_source.py        # 视频源管理
+├── models/
+│   └── schemas.py             # 数据模型定义
+├── utils/
+│   ├── logger.py              # 日志
+│   └── image_utils.py         # 图像工具
+├── finetune_yolo.py           # YOLO 微调脚本
+├── tracker_guide.md           # 跟踪器调参指南
+└── requirements.txt           # 依赖
 ```
 
-**高速场景（实时性优先）：**
+## 微调 YOLO（可选）
+
+```bash
+python finetune_yolo.py --data dataset.yaml --pretrained yolov8n.pt --epochs 100
+```
+
+微调完成后在 `config.yaml` 中更新模型路径：
 ```yaml
 detector:
-  confidence: 0.5
-  nms_iou: 0.5
-tracker:
-  enabled: true
-  tracker_type: "bytetrack"
-  track_high_thresh: 0.5
-  track_low_thresh: 0.2
-  match_thresh: 0.5
-  track_buffer: 15
-```
-
-**仅检测不需要跟踪：**
-```yaml
-tracker:
-  enabled: false
+  model: "runs/finetune/finetune_xxxx/weights/best.pt"
 ```
