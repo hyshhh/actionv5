@@ -193,8 +193,6 @@ class VideoSource:
 
         return False, None
 
-        return False, None
-
     def frames(self) -> Generator[np.ndarray, None, None]:
         """
         帧迭代器，自动处理重连。

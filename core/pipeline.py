@@ -70,6 +70,7 @@ class _ConcurrentTask:
         self.tagged_behaviors: list[tuple[int, BehaviorResult]] = []
         self.completed = False
         self.error: Optional[Exception] = None
+        self.elapsed: float = 0.0  # 实际 Qwen 推理耗时（不含排队等待）
 
 
 # =====================================================================
@@ -606,6 +607,7 @@ class Pipeline:
 
             qwen_elapsed = time.time() - qwen_start
             self._qwen_fps_tracker.record(qwen_elapsed)
+            task.elapsed = qwen_elapsed
 
             task.completed = True
 
@@ -894,6 +896,7 @@ class Pipeline:
 
         analysis.behaviors = behaviors
         analysis.behavior_dicts = behavior_dicts
+        analysis.processing_time = task.elapsed
 
         # 保存标注帧
         if self.save_annotated:
