@@ -10,11 +10,13 @@
 - [系统架构](#系统架构)
 - [环境准备](#环境准备)
 - [安装依赖](#安装依赖)
-- [配置说明](#配置说明)
+- [配置文件详解](#配置文件详解)
 - [运行方式](#运行方式)
 - [本地模型部署](#本地模型部署可选)
 - [微调 YOLO](#微调-yolo可选)
+- [性能监控](#性能监控)
 - [项目结构](#项目结构)
+- [输出文件](#输出文件)
 - [常见问题](#常见问题)
 
 ---
@@ -28,13 +30,16 @@
 ```
 
 **核心特性：**
-- 🎯 YOLOv8/v11 人体检测 + ByteTrack 目标跟踪
-- 🧠 云端千问 API（qwen3-vl-flash）/ 本地 vLLM 部署双模式推理
+- 🎯 YOLOv8/v11 人体检测 + ByteTrack / BotSORT 目标跟踪
+- 🧠 云端千问 API / 本地 vLLM 部署双模式推理
+- ⚡ YOLO 隔帧推理（节省 GPU 资源）
+- 🔀 外层并发模式（YOLO 不等 Qwen，异步出队结果）
 - 🔍 自适应 padding + 关键帧提取
 - 📊 可扩展行为类别（溺水/游泳/翻栏杆/正常行走/救援/在船上）
 - ⚠️ 分级告警（critical / warning / normal）+ 冷却机制
 - 📝 摄像头行为日志（自动清理过期记录）
 - 🔄 断线重连（RTSP/USB 摄像头）
+- 📈 实时速度监控：YOLO FPS、Qwen 吞吐、码流速度
 
 ---
 
@@ -45,13 +50,22 @@
 │  VideoSource │───>│  Detector    │───>│ FrameExtractor   │───>│ Classifier  │
 │  视频/摄像头  │    │  YOLO+Track  │    │ 裁剪+自适应padding│    │ 千问多模态  │
 └──────────────┘    └──────────────┘    └──────────────────┘    └─────────────┘
-                                                                       │
-                                                                       v
-                                                              ┌──────────────┐
-                                                              │   Pipeline   │
-                                                              │ 告警/日志/显示 │
-                                                              └──────────────┘
+       │                   │                                           │
+       │                   v                                           v
+       │            ┌─────────────┐                             ┌──────────────┐
+       │            │FrameRate    │                             │   Pipeline   │
+       └───────────>│Tracker      │                             │ 告警/日志/显示 │
+                    │Bitrate      │                             └──────────────┘
+                    │Tracker      │
+                    └─────────────┘
 ```
+
+**两种处理模式：**
+
+| 模式 | 说明 | 适用场景 |
+|------|------|---------|
+| 级联模式 | 每触发点同步等 Qwen 结果再继续 | 简单、低资源 |
+| 并发模式 (`concurrent_mode: true`) | YOLO 不等 Qwen，结果异步出队 | 高吞吐、实时性要求高 |
 
 ---
 
@@ -125,36 +139,50 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ---
 
-## 配置说明
+## 配置文件详解
 
-编辑 `config.yaml`，关键配置项如下：
+配置文件为 `config.yaml`，以下是每个字段的完整说明。
 
-### 模型运行模式
-
-```yaml
-model_mode: "local"    # "api" = 阿里云百炼千问 | "local" = 本地 vLLM
-```
-
-### 提示词模式
+### 顶层配置
 
 ```yaml
-prompt_mode: "detailed"  # "detailed" = 详细版 | "brief" = 简练版（省 token）
+model_mode: "local"      # 模型运行模式
+prompt_mode: "detailed"  # 提示词模式
 ```
+
+| 字段 | 类型 | 可选值 | 说明 |
+|------|------|--------|------|
+| `model_mode` | string | `"api"` / `"local"` | `"api"` = 调用阿里云百炼千问 API；`"local"` = 调用本地 vLLM 部署的模型 |
+| `prompt_mode` | string | `"detailed"` / `"brief"` | `"detailed"` = 详细提示词（效果更好，token 消耗更高）；`"brief"` = 简练提示词（轻量运行） |
 
 提示词模板存放于 `prompts/` 目录，支持自定义编辑。
 
-### 云端 API 配置（model_mode = "api"）
+---
+
+### 云端 API 配置（`model_mode = "api"` 时生效）
 
 ```yaml
 qwen:
-  api_key: ""                    # 也可通过环境变量 QWEN_API_KEY 设置
+  api_key: ""
   api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  model: "qwen3-vl-flash"       # 性价比高；可选 "qwen-vl-max"（更准但更贵）
+  model: "qwen3-vl-flash"
   max_tokens: 100
   temperature: 0.01
+  timeout: 30
 ```
 
-### 本地 vLLM 配置（model_mode = "local"）
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `api_key` | string | `""` | API 密钥。也可通过环境变量 `QWEN_API_KEY` 设置，优先级：命令行 `--api-key` > 环境变量 > config |
+| `api_url` | string | 见上 | 阿里云百炼 OpenAI 兼容接口地址，一般不用改 |
+| `model` | string | `"qwen3-vl-flash"` | 模型名称。可选 `"qwen-vl-max"`（更准但更贵） |
+| `max_tokens` | int | `100` | 最大生成 token 数。行为识别一般 100-512 足够 |
+| `temperature` | float | `0.01` | 生成温度。越低越确定，推荐 `0.01` ~ `0.1` |
+| `timeout` | int | `30` | API 请求超时（秒） |
+
+---
+
+### 本地 vLLM 配置（`model_mode = "local"` 时生效）
 
 ```yaml
 local_model:
@@ -166,63 +194,239 @@ local_model:
   timeout: 60
 ```
 
-### 检测器 (detector)
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `api_key` | string | `"abc123"` | vLLM `--api-key` 设置的密钥。无鉴权时留空 |
+| `api_url` | string | `"http://localhost:7890/v1"` | vLLM 服务地址 |
+| `model` | string | `"Qwen/Qwen3-VL-4B-AWQ"` | `--served-model-name` 设置的模型名，必须一致 |
+| `max_tokens` | int | `128` | 最大生成 token 数 |
+| `temperature` | float | `0.1` | 生成温度 |
+| `timeout` | int | `60` | 本地推理超时（秒），本地推理可能更慢 |
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `model` | `yolo11n.pt` | YOLO 模型路径，首次运行自动下载 |
-| `confidence` | `0.1` | 检测置信度阈值 |
-| `device` | `cuda:0` | 推理设备：`cpu` / `cuda:0` |
-| `class_ids` | `[0, 1, 2]` | 检测类别 ID 列表，全部当作"人"处理 |
-| `detect_width` | `640` | 推理宽度，`0` = 保持原始分辨率 |
-| `detect_height` | `640` | 推理高度，`0` = 保持原始分辨率 |
-| `nms_iou` | `0.1` | NMS IoU 阈值，越小越严格 |
+---
 
-### 跟踪器 (tracker)
+### 人体检测器（`detector`）
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `enabled` | `false` | `true` = 启用跟踪（带 ID）/ `false` = 仅检测 |
-| `tracker_type` | `bytetrack` | `bytetrack` / `botsort` |
-| `track_high_thresh` | `0.6` | 高置信度跟踪阈值 |
-| `track_low_thresh` | `0.3` | 低置信度跟踪阈值 |
-| `match_thresh` | `0.8` | IoU 匹配阈值 |
-| `track_buffer` | `30` | 跟踪丢失后保留帧数 |
+```yaml
+detector:
+  model: "yolo11n.pt"
+  confidence: 0.1
+  device: "cuda:0"
+  class_ids: [0, 1, 2]
+  detect_width: 640
+  detect_height: 640
+  nms_iou: 0.1
+  yolo_skip_frames: 0
+```
 
-### 关键帧提取 (frame_extractor)
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model` | string | `"yolo11n.pt"` | YOLO 模型文件路径。首次运行自动下载。常用：`yolov8n.pt`（快）、`yolov8s.pt`（准）、`yolo11n.pt`（最新） |
+| `confidence` | float | `0.1` | 检测置信度阈值。低于此值的检测框会被丢弃。越低召回越多，但误检也越多 |
+| `device` | string | `"cuda:0"` | 推理设备。`"cpu"` = 纯 CPU；`"cuda:0"` = 第一块 GPU |
+| `class_ids` | list[int] | `[0, 1, 2]` | 要检测的 COCO 类别 ID 列表。`0`=人，`1`=自行车，`2`=汽车。全部当作"人"处理 |
+| `detect_width` | int | `640` | 推理输入宽度（像素）。`0` = 保持原始分辨率。降低可加速但损失精度 |
+| `detect_height` | int | `640` | 推理输入高度（像素）。`0` = 保持原始分辨率 |
+| `nms_iou` | float | `0.1` | NMS（非极大值抑制）IoU 阈值。越小越严格，更多重叠框被合并。推荐 `0.1` ~ `0.5` |
+| `yolo_skip_frames` | int | `0` | YOLO 隔帧推理间隔。`0` = 每帧都推理；`N` = 每 N+1 帧推理 1 次，中间帧复用上次结果。节省 GPU 资源 |
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `padding_ratio` | `0.15` | 裁剪 padding 倍率 |
-| `keyframe_interval` | `1` | 每隔几帧提取一帧 |
-| `keyframe_count` | `1` | 关键帧数量上限 |
-| `adaptive_padding` | `true` | 小目标自动放大 padding |
-| `pixel_threshold` | `20000` | 最小裁剪面积阈值（像素²） |
+---
 
-### 行为类别
+### 目标跟踪器（`tracker`）
 
-| ID | 中文 | 英文 | 严重等级 |
-|----|------|------|---------|
-| 0 | 溺水 | drowning | 🔴 critical |
-| 1 | 游泳 | swimming | 🟢 normal |
-| 2 | 攀爬栏杆 | climbing | 🟠 warning |
-| 3 | 正常行走 | normal_walking | 🟢 normal |
-| 4 | 正在救援 | waterhelping | 🟢 normal |
-| 5 | 在船上 | abord | 🟢 normal |
+```yaml
+tracker:
+  enabled: false
+  tracker_type: "bytetrack"
+  track_high_thresh: 0.6
+  track_low_thresh: 0.3
+  match_thresh: 0.8
+  track_buffer: 30
+  with_reid: false
+```
 
-> 行为类别可在 `config.yaml` 中的 `behavior_classes` 自定义扩展。
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用目标跟踪。`true` = 为每个人分配稳定 ID；`false` = 仅检测，无 ID |
+| `tracker_type` | string | `"bytetrack"` | 跟踪器类型。`"bytetrack"` = 速度快；`"botsort"` = 更稳定但更慢 |
+| `track_high_thresh` | float | `0.6` | 高置信度跟踪阈值。高于此值的检测框直接匹配 |
+| `track_low_thresh` | float | `0.3` | 低置信度跟踪阈值。ByteTrack 二次匹配用 |
+| `match_thresh` | float | `0.8` | IoU 匹配阈值。越高要求匹配越精确 |
+| `track_buffer` | int | `30` | 跟踪丢失后保留帧数。人暂时离开画面时 ID 不会立刻消失 |
+| `with_reid` | bool | `false` | BotSORT 是否启用 ReID 外观特征匹配（需额外下载模型） |
 
-### 流水线 (pipeline)
+> 详细调参参考 `tracker_guide.md`。
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `process_every_n_frames` | `1` | 每 N 帧触发一次推理 |
-| `buffer_size` | `1` | 历史帧缓冲区大小（仅追踪模式） |
-| `max_concurrent` | `5` | 最大并发 API 请求数 |
-| `alert_cooldown` | `5` | 同一行为告警冷却（秒） |
-| `display` | `true` | 是否显示实时画面 |
-| `display_scale` | `0.1` | 视频窗口缩放比例 |
-| `sustained_detection_frames` | `1` | 连续 N 帧检测到目标才触发 API |
+---
+
+### 关键帧提取（`frame_extractor`）
+
+```yaml
+frame_extractor:
+  padding_ratio: 0.15
+  keyframe_interval: 1
+  keyframe_count: 1
+  min_region_size: 32
+  adaptive_padding: true
+  pixel_threshold: 20000
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `padding_ratio` | float | `0.15` | 正常 padding 倍率。检测框四周各扩展 15%。大目标使用此值 |
+| `keyframe_interval` | int | `1` | 每隔几帧提取一帧关键帧。`1` = 每帧都取 |
+| `keyframe_count` | int | `1` | 提取的关键帧数量上限。更多帧给模型更多信息，但 token 消耗更高 |
+| `min_region_size` | int | `32` | 最小有效区域像素。裁剪区域小于此值时跳过 |
+| `adaptive_padding` | bool | `true` | 是否启用自适应 padding。小目标自动放大裁剪区域 |
+| `pixel_threshold` | float | `20000` | 最小裁剪面积阈值（像素²）。检测框面积小于此值时，padding 自动放大使裁剪区域达到此面积 |
+
+---
+
+### 行为类别（`behavior_classes`）
+
+```yaml
+behavior_classes:
+  - id: "0"
+    label_cn: 溺水
+    label_en: drowning
+    severity: critical
+    description: >
+      四肢无规律挣扎，有溺水风险。
+  # ... 更多类别
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | string | 行为唯一标识，模型返回的 `behavior_id` 必须匹配 |
+| `label_cn` | string | 中文标签 |
+| `label_en` | string | 英文标签 |
+| `severity` | string | 严重等级：`critical`（危险告警）/ `warning`（警告）/ `normal`（正常） |
+| `description` | string | 行为描述，会写入提示词帮助模型识别 |
+
+**内置行为类别：**
+
+| ID | 中文 | 英文 | 严重等级 | 说明 |
+|----|------|------|---------|------|
+| 0 | 溺水 | drowning | 🔴 critical | 四肢无规律挣扎 |
+| 1 | 游泳 | swimming | 🟢 normal | 正常游泳 |
+| 2 | 攀爬栏杆 | climbing | 🟠 warning | 攀爬或翻越栏杆 |
+| 3 | 正常行走 | normal_walking | 🟢 normal | 岸上正常行走或站立 |
+| 4 | 正在救援 | waterhelping | 🟢 normal | 水中人员抱住救生圈 |
+| 5 | 在船上 | abord | 🟢 normal | 人员在船上或开船 |
+
+> 可在 `behavior_classes` 中自定义扩展新类别。添加后对应的提示词模板也需相应调整。
+
+---
+
+### 视频源（`video_source`）
+
+```yaml
+video_source:
+  camera_id: 0
+  rtsp_url: ""
+  frame_width: 640
+  frame_height: 480
+  reconnect_threshold: 10
+  reconnect_delay: 2.0
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `camera_id` | int | `0` | USB 摄像头设备 ID。Linux 下 `ls /dev/video*` 查看 |
+| `rtsp_url` | string | `""` | RTSP 流地址，如 `rtsp://192.168.1.100:554/stream` |
+| `frame_width` | int | `640` | 目标帧宽度。`0` = 保持原始分辨率 |
+| `frame_height` | int | `480` | 目标帧高度。`0` = 保持原始分辨率 |
+| `reconnect_threshold` | int | `10` | 连续失败多少帧后触发重连（仅摄像头/RTSP） |
+| `reconnect_delay` | float | `2.0` | 重连等待时间（秒） |
+
+---
+
+### 输出配置（`output`）
+
+```yaml
+output:
+  save_annotated: true
+  save_crops: true
+  save_report: true
+  output_dir: "output"
+  report_format: "json"
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `save_annotated` | bool | `true` | 是否保存标注后的帧图片（带检测框和行为标签） |
+| `save_crops` | bool | `true` | 是否保存人体裁剪图 |
+| `save_report` | bool | `true` | 是否保存分析报告 JSON |
+| `output_dir` | string | `"output"` | 输出目录路径 |
+| `report_format` | string | `"json"` | 报告格式（目前仅支持 `json`） |
+
+---
+
+### 流水线（`pipeline`）
+
+```yaml
+pipeline:
+  process_every_n_frames: 1
+  buffer_size: 1
+  max_concurrent: 5
+  alert_cooldown: 5
+  display: true
+  display_scale: 0.1
+  camera_interval: 0.1
+  sustained_detection_frames: 1
+  concurrent_mode: false
+  max_queued_frames: 50
+  display_input: false
+  display_output: true
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `process_every_n_frames` | int | `1` | 每 N 帧触发一次行为分析。`1` = 每帧都分析；增大可降低 API 调用频率 |
+| `buffer_size` | int | `1` | 历史帧缓冲区大小。仅追踪模式生效，控制时间窗口范围 |
+| `max_concurrent` | int | `5` | 最大并发 API 请求数。`1` = 串行；`≥2` = 启用并发线程池 |
+| `alert_cooldown` | int | `5` | 同一行为告警冷却时间（秒）。防止同一行为反复告警 |
+| `display` | bool | `true` | 是否显示实时画面。服务器/无头环境设为 `false` |
+| `display_scale` | float | `0.1` | 视频窗口缩放比例。`0.5` = 缩小一半 |
+| `camera_interval` | float | `0.1` | 摄像头读取间隔（秒）。控制摄像头调用频率 |
+| `sustained_detection_frames` | int | `1` | 连续 N 帧检测到目标才触发 API。减少误触发 |
+| `concurrent_mode` | bool | `false` | 是否启用外层并发模式。见下方说明 |
+| `max_queued_frames` | int | `50` | 并发模式下最大队列帧数。防止内存溢出 |
+| `display_input` | bool | `false` | 是否显示原始输入画面（功能 4） |
+| `display_output` | bool | `true` | 是否显示标注后的输出画面（功能 4） |
+
+**`concurrent_mode` 两种模式对比：**
+
+```
+级联模式 (concurrent_mode: false):
+  帧 → YOLO → [等待Qwen结果] → 帧 → YOLO → [等待Qwen结果] → ...
+
+并发模式 (concurrent_mode: true):
+  帧 → YOLO → 帧 → YOLO → 帧 → YOLO → ...
+                    ↓             ↓             ↓
+              提交Qwen任务    提交Qwen任务    提交Qwen任务
+                    ↓             ↓             ↓
+              异步出队结果    异步出队结果    异步出队结果
+```
+
+当 `max_queued_frames` 队列满时，新任务会被丢弃并打印警告日志。
+
+---
+
+### 摄像头日志（`camera_log`）
+
+```yaml
+camera_log:
+  enabled: true
+  retention_hours: 2.0
+  log_filename: "camera_behavior_log.json"
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `true` | 是否启用摄像头行为日志。仅摄像头/RTSP 模式生效 |
+| `retention_hours` | float | `2.0` | 日志保留时长（小时）。超过自动删除过期条目 |
+| `log_filename` | string | `"camera_behavior_log.json"` | 日志文件名 |
 
 ---
 
@@ -269,7 +473,13 @@ python main.py --source rtsp --rtsp-url rtsp://192.168.1.100:554/stream --model-
 ffplay rtsp://192.168.1.100:554/stream
 ```
 
-### 5. 完整命令行参数
+### 5. 并发模式
+
+```bash
+python main.py --source video --input video.mp4 --concurrent --max-concurrent 5
+```
+
+### 6. 完整命令行参数
 
 ```bash
 python main.py \
@@ -280,12 +490,14 @@ python main.py \
   --config config.yaml \
   --output output/ \
   --display-scale 0.5 \
-  --max-concurrent 5
+  --max-concurrent 5 \
+  --concurrent \
+  --verbose
 ```
 
 | 参数 | 说明 |
 |------|------|
-| `--source, -s` | 输入源：`video` / `camera` / `rtsp` |
+| `--source, -s` | 输入源：`video` / `camera` / `rtsp`（必填） |
 | `--input, -i` | 视频文件路径 |
 | `--camera-id` | USB 摄像头 ID（默认 0） |
 | `--rtsp-url` | RTSP 流地址 |
@@ -295,9 +507,14 @@ python main.py \
 | `--output, -o` | 输出目录 |
 | `--no-display` | 无头模式（服务器环境） |
 | `--no-crops` | 不保存人体裁剪图 |
+| `--camera-interval` | 摄像头读取间隔（秒） |
 | `--display-scale` | 窗口缩放比例 |
 | `--max-concurrent` | 最大并发数 |
+| `--concurrent` | 启用外层并发模式 |
+| `--show-input` | 同时显示原始输入画面 |
 | `--verbose, -v` | 详细日志 |
+
+> 命令行参数优先级高于 `config.yaml`。未指定的命令行参数不会覆盖配置文件中的值。
 
 ---
 
@@ -439,10 +656,33 @@ detector:
 
 ---
 
+## 性能监控
+
+系统内置三类实时速度统计，每 2 秒打印一次到终端和日志：
+
+```
+[Speed] YOLO:  28.3 frames/s (infer   35.2ms, min=32.1 max=41.5ms) | Stream:  156.20 MB/s | Qwen:   0.42 req/s (avg 2300.0ms, count=15)
+```
+
+| 指标 | 含义 |
+|------|------|
+| **YOLO frames/s** | 实际画面处理帧率（含隔帧推理时的缓存命中） |
+| **infer ms** | YOLO 单次推理耗时（min/max 反映波动范围） |
+| **Stream MB/s** | 原始帧数据吞吐量。640×480×3B = ~0.88 MB/帧，30fps ≈ 26.4 MB/s |
+| **Qwen req/s** | Qwen API 吞吐量（滑动窗口 10 秒统计） |
+| **avg ms** | Qwen 单次 API 请求平均耗时 |
+| **count** | 累计完成的 API 请求数 |
+
+画面叠加也会显示这些信息（display_output 开启时）。
+
+最终摘要会在运行结束时打印完整统计。
+
+---
+
 ## 项目结构
 
 ```
-actionv3/
+actionv5/
 ├── main.py                        # 主入口
 ├── config.yaml                    # 全局配置
 ├── prompts/                       # 提示词模板
@@ -450,8 +690,8 @@ actionv3/
 │   └── brief_prompt.txt           #   简练版提示词
 ├── core/
 │   ├── __init__.py
-│   ├── detector.py                #   YOLO 人体检测 + ByteTrack/BotSORT 跟踪
-│   ├── pipeline.py                #   推理流水线（检测→提取→分类→告警→日志）
+│   ├── detector.py                #   YOLO 人体检测 + ByteTrack/BotSORT 跟踪 + 隔帧推理
+│   ├── pipeline.py                #   推理流水线（级联/并发模式、FPS/码流统计、告警、日志）
 │   ├── behavior_classifier.py     #   行为分类器（云端 API / 本地 vLLM）
 │   ├── frame_extractor.py         #   关键帧提取 + 自适应 padding
 │   └── video_source.py            #   视频源管理（文件/USB/RTSP + 断线重连）
@@ -476,11 +716,28 @@ actionv3/
 
 ```
 output/
-├── analysis_report.json           # 分析报告（帧数、行为统计、运行时长）
-├── alerts.json                    # 告警记录
-├── camera_behavior_log.json       # 摄像头行为日志（自动清理过期条目）
-├── annotated/                     # 标注后的帧图片
+├── analysis_report.json           # 分析报告（帧数、行为统计、运行时长、速度统计）
+├── alerts.json                    # 告警记录（仅存在告警时生成）
+├── camera_behavior_log.json       # 摄像头行为日志（自动清理过期条目，仅摄像头模式）
+├── annotated/                     # 标注后的帧图片（带检测框和行为标签）
 └── crops/                         # 人体裁剪图
+```
+
+`analysis_report.json` 示例：
+```json
+{
+  "source": "video",
+  "duration_seconds": 45.32,
+  "total_frames": 1360,
+  "processed_frames": 1360,
+  "total_detections": 892,
+  "behavior_counts": {
+    "0": 3,
+    "1": 456,
+    "3": 433
+  },
+  "alert_count": 3
+}
 ```
 
 ---
@@ -525,3 +782,8 @@ detector:
 - 增大 `process_every_n_frames`（如 `5`）
 - 使用 GPU：`device: "cuda:0"`
 - 使用量化模型（AWQ-4bit）减少显存占用
+- 启用隔帧推理：`yolo_skip_frames: 2`（每 3 帧推理 1 次）
+
+### Q: 并发模式下结果延迟
+- `max_queued_frames` 队列满时会丢弃新任务，适当增大
+- 检查 Qwen API 响应速度，本地模型可调大 `max_concurrent`
