@@ -272,6 +272,55 @@ class FrameRateTracker:
         }
 
 
+class TotalFrameTracker:
+    """
+    总单帧推理耗时统计。
+
+    统计从帧进入流水线（Step 1: YOLO检测开始）到
+    该帧所有处理完成（含 Qwen 推理，若触发）的端到端耗时。
+
+    注意：process_every_n_frames > 1 时，非触发帧不含 Qwen 耗时，
+    统计结果反映的是混合场景下的平均端到端延迟。
+    """
+
+    def __init__(self, window_seconds: float = 10.0):
+        self._window_seconds = window_seconds
+        self._records: list[tuple[float, float]] = []  # [(timestamp, elapsed_seconds), ...]
+        self._total_count: int = 0
+
+    def record(self, elapsed: float):
+        """每处理完一帧调用一次（含 YOLO + Qwen 端到端）"""
+        self._records.append((time.time(), elapsed))
+        self._total_count += 1
+        # 滑动窗口裁剪
+        if len(self._records) > 200:
+            self._records = self._records[100:]
+
+    def _cleanup(self):
+        if not self._records:
+            return
+        cutoff = time.time() - self._window_seconds
+        idx = 0
+        while idx < len(self._records) and self._records[idx][0] < cutoff:
+            idx += 1
+        if idx > 0:
+            self._records = self._records[idx:]
+
+    def get_stats(self) -> dict:
+        self._cleanup()
+        if not self._records:
+            return {"avg_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "fps": 0.0, "count": 0}
+        times_ms = [t * 1000 for _, t in self._records]
+        avg_ms = sum(times_ms) / len(times_ms)
+        return {
+            "avg_ms": round(avg_ms, 2),
+            "min_ms": round(min(times_ms), 2),
+            "max_ms": round(max(times_ms), 2),
+            "fps": round(1000.0 / avg_ms, 1) if avg_ms > 0 else 0.0,
+            "count": self._total_count,
+        }
+
+
 class BitrateTracker:
     """
     视频码流速度统计。
@@ -494,6 +543,9 @@ class Pipeline:
         # 码流速度统计
         self._bitrate_tracker = BitrateTracker()
 
+        # 总单帧端到端耗时统计
+        self._total_frame_tracker = TotalFrameTracker()
+
         # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)
         if save_crops:
@@ -642,6 +694,9 @@ class Pipeline:
                 # 记录码流数据
                 self._bitrate_tracker.record(frame)
 
+                # 端到端计时开始
+                frame_start_time = time.time()
+
                 # Step 1: 人体检测（含隔帧推理）
                 detections = self.detector.detect(frame, self._frame_count)
                 self._yolo_frame_rate.tick()  # 记录实际画面处理帧率
@@ -688,6 +743,10 @@ class Pipeline:
                 # Step 6: 可视化
                 if self.display:
                     self._render_display(frame, detections, frame_analysis)
+
+                # 记录端到端总耗时（YOLO + Qwen）
+                frame_elapsed = time.time() - frame_start_time
+                self._total_frame_tracker.record(frame_elapsed)
 
                 # Step 7: 功能3 — 定期打印 FPS
                 if current_time - last_fps_print_time >= fps_print_interval:
@@ -1212,12 +1271,14 @@ class Pipeline:
         yolo_fr = self._yolo_frame_rate.get_stats()
         qwen_stats = self._qwen_fps_tracker.get_stats()
         stream_stats = self._bitrate_tracker.get_stats()
+        total_stats = self._total_frame_tracker.get_stats()
         fps_text = (
             f"YOLO: {yolo_fr['frame_rate']:.1f} frames/s | "
             f"infer {yolo_stats['avg_ms']:.1f}ms | "
             f"Stream: {stream_stats['mbps']:.1f} MB/s | "
             f"Qwen: {qwen_stats['throughput']:.2f} req/s "
-            f"(avg {qwen_stats['avg_ms']:.0f}ms)"
+            f"(avg {qwen_stats['avg_ms']:.0f}ms) | "
+            f"Total: {total_stats['avg_ms']:.0f}ms/frame ({total_stats['fps']:.1f} fps)"
         )
         cv2.putText(annotated, fps_text, (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
@@ -1242,11 +1303,12 @@ class Pipeline:
     # ==================================================================
 
     def _print_fps_stats(self):
-        """功能3：在终端和日志中打印 YOLO、Qwen、码流速度"""
+        """功能3：在终端和日志中打印 YOLO、Qwen、码流速度、总单帧耗时"""
         yolo_stats = self.detector.get_fps_stats()
         yolo_fr = self._yolo_frame_rate.get_stats()
         qwen_stats = self._qwen_fps_tracker.get_stats()
         stream_stats = self._bitrate_tracker.get_stats()
+        total_stats = self._total_frame_tracker.get_stats()
 
         fps_line = (
             f"[Speed] YOLO: {yolo_fr['frame_rate']:6.1f} frames/s "
@@ -1254,7 +1316,10 @@ class Pipeline:
             f"min={yolo_stats['min_ms']:.1f} max={yolo_stats['max_ms']:.1f}ms) | "
             f"Stream: {stream_stats['mbps']:7.2f} MB/s | "
             f"Qwen: {qwen_stats['throughput']:6.2f} req/s "
-            f"(avg {qwen_stats['avg_ms']:6.1f}ms, count={qwen_stats['count']})"
+            f"(avg {qwen_stats['avg_ms']:6.1f}ms, count={qwen_stats['count']}) | "
+            f"Total/frame: {total_stats['avg_ms']:6.1f}ms "
+            f"(min={total_stats['min_ms']:.1f} max={total_stats['max_ms']:.1f}ms, "
+            f"{total_stats['fps']:.1f} frames/s)"
         )
         logger.info(fps_line)
 
@@ -1415,6 +1480,7 @@ class Pipeline:
         yolo_fr = self._yolo_frame_rate.get_stats()
         qwen_stats = self._qwen_fps_tracker.get_stats()
         stream_stats = self._bitrate_tracker.get_stats()
+        total_stats = self._total_frame_tracker.get_stats()
 
         logger.info("=" * 60)
         logger.info("分析完成! 摘要:")
@@ -1429,6 +1495,7 @@ class Pipeline:
         logger.info(f"  YOLO: {yolo_fr['frame_rate']:.1f} frames/s (infer avg={yolo_stats['avg_ms']:.1f}ms min={yolo_stats['min_ms']:.1f} max={yolo_stats['max_ms']:.1f}ms, {yolo_stats['count']} 次)")
         logger.info(f"  Stream: {stream_stats['mbps']:.2f} MB/s (total {stream_stats['total_mb']:.1f} MB, avg {stream_stats.get('avg_frame_kb', 0):.1f} KB/frame)")
         logger.info(f"  Qwen: {qwen_stats['throughput']:.2f} req/s (avg {qwen_stats['avg_ms']:.1f}ms, {qwen_stats['count']} 次)")
+        logger.info(f"  Total/frame: avg={total_stats['avg_ms']:.1f}ms min={total_stats['min_ms']:.1f}ms max={total_stats['max_ms']:.1f}ms ({total_stats['fps']:.1f} frames/s, {total_stats['count']} 帧)")
         if self._camera_log is not None:
             logger.info(f"  日志条目: {self._camera_log.entry_count}")
         logger.info("=" * 60)
