@@ -168,6 +168,7 @@ class QwenFpsTracker:
     """
 
     def __init__(self, window_seconds: float = 10.0):
+        self._lock = threading.Lock()
         self._inference_times: list[float] = []
         self._total_count: int = 0
         # 滑动窗口：记录每次完成的时间戳
@@ -178,15 +179,16 @@ class QwenFpsTracker:
 
     def record(self, elapsed: float):
         now = time.time()
-        self._inference_times.append(elapsed)
-        self._total_count += 1
-        self._completion_timestamps.append(now)
-        # 滑动窗口裁剪：防止无限增长
-        if len(self._inference_times) > self._latency_window_max:
-            self._inference_times = self._inference_times[self._latency_window_max // 2:]
+        with self._lock:
+            self._inference_times.append(elapsed)
+            self._total_count += 1
+            self._completion_timestamps.append(now)
+            # 滑动窗口裁剪：防止无限增长
+            if len(self._inference_times) > self._latency_window_max:
+                self._inference_times = self._inference_times[self._latency_window_max // 2:]
 
     def _cleanup_window(self):
-        """清理窗口外的旧记录"""
+        """清理窗口外的旧记录（调用方需持有 _lock）"""
         if not self._completion_timestamps:
             return
         cutoff = time.time() - self._window_seconds
@@ -200,32 +202,41 @@ class QwenFpsTracker:
     @property
     def throughput(self) -> float:
         """实际吞吐量：滑动窗口内每秒完成的请求数（反映多线程并发效果）"""
-        self._cleanup_window()
-        if len(self._completion_timestamps) < 2:
-            return 0.0
-        span = self._completion_timestamps[-1] - self._completion_timestamps[0]
-        if span <= 0:
-            return 0.0
-        return (len(self._completion_timestamps) - 1) / span
+        with self._lock:
+            self._cleanup_window()
+            if len(self._completion_timestamps) < 2:
+                return 0.0
+            span = self._completion_timestamps[-1] - self._completion_timestamps[0]
+            if span <= 0:
+                return 0.0
+            return (len(self._completion_timestamps) - 1) / span
 
     def get_stats(self) -> dict:
-        if not self._inference_times:
+        with self._lock:
+            if not self._inference_times:
+                return {
+                    "throughput": 0.0,
+                    "avg_ms": 0.0, "count": 0,
+                    "min_ms": 0.0, "max_ms": 0.0,
+                }
+            # 延迟统计：取最近 50 次
+            window = self._inference_times[-50:]
+            times_ms = [t * 1000 for t in window]
+            avg_ms = sum(times_ms) / len(times_ms)
+            # 吞吐量：滑动窗口
+            self._cleanup_window()
+            if len(self._completion_timestamps) >= 2:
+                span = self._completion_timestamps[-1] - self._completion_timestamps[0]
+                tp = round((len(self._completion_timestamps) - 1) / span, 2) if span > 0 else 0.0
+            else:
+                tp = 0.0
             return {
-                "throughput": 0.0,
-                "avg_ms": 0.0, "count": 0,
-                "min_ms": 0.0, "max_ms": 0.0,
+                "throughput": tp,
+                "avg_ms": round(avg_ms, 2),
+                "count": self._total_count,
+                "min_ms": round(min(times_ms), 2),
+                "max_ms": round(max(times_ms), 2),
             }
-        # 延迟统计：取最近 50 次
-        window = self._inference_times[-50:]
-        times_ms = [t * 1000 for t in window]
-        avg_ms = sum(times_ms) / len(times_ms)
-        return {
-            "throughput": round(self.throughput, 2),
-            "avg_ms": round(avg_ms, 2),
-            "count": self._total_count,
-            "min_ms": round(min(times_ms), 2),
-            "max_ms": round(max(times_ms), 2),
-        }
 
 
 class FrameRateTracker:
@@ -240,10 +251,14 @@ class FrameRateTracker:
     def __init__(self, window_seconds: float = 10.0):
         self._window_seconds = window_seconds
         self._timestamps: list[float] = []
+        self._max_timestamps: int = 2000  # 写侧上限
 
     def tick(self):
         """每处理一帧（含缓存命中）调用一次"""
         self._timestamps.append(time.time())
+        # 写侧裁剪：防止无限增长
+        if len(self._timestamps) > self._max_timestamps:
+            self._timestamps = self._timestamps[self._max_timestamps // 2:]
 
     def _cleanup(self):
         if not self._timestamps:
@@ -335,6 +350,7 @@ class BitrateTracker:
         self._window_seconds = window_seconds
         self._records: list[tuple[float, int]] = []  # [(timestamp, frame_bytes), ...]
         self._total_bytes: int = 0
+        self._max_records: int = 2000  # 写侧上限（~80fps x 25s 窗口）
 
     def record(self, frame: np.ndarray):
         """每读取一帧调用一次"""
@@ -342,6 +358,9 @@ class BitrateTracker:
         nbytes = frame.nbytes
         self._records.append((now, nbytes))
         self._total_bytes += nbytes
+        # 写侧裁剪：防止无限增长
+        if len(self._records) > self._max_records:
+            self._records = self._records[self._max_records // 2:]
 
     def _cleanup(self):
         if not self._records:
@@ -1276,8 +1295,8 @@ class Pipeline:
         stream_stats = self._bitrate_tracker.get_stats()
         total_stats = self._total_frame_tracker.get_stats()
         fps_text = (
-            f"YOLO: {yolo_fr['frame_rate']:.1f} frames/s | "
-            f"infer {yolo_stats['avg_ms']:.1f}ms | "
+            f"Loop: {yolo_fr['frame_rate']:.1f} frames/s | "
+            f"YOLO infer: {yolo_stats['avg_ms']:.1f}ms | "
             f"Stream: {stream_stats['mbps']:.1f} MB/s | "
             f"Qwen: {qwen_stats['throughput']:.2f} req/s "
             f"(avg {qwen_stats['avg_ms']:.0f}ms) | "
@@ -1314,13 +1333,13 @@ class Pipeline:
         total_stats = self._total_frame_tracker.get_stats()
 
         fps_line = (
-            f"[Speed] YOLO: {yolo_fr['frame_rate']:6.1f} frames/s "
-            f"(infer {yolo_stats['avg_ms']:6.1f}ms, "
-            f"min={yolo_stats['min_ms']:.1f} max={yolo_stats['max_ms']:.1f}ms) | "
-            f"Stream: {stream_stats['mbps']:7.2f} MB/s | "
-            f"Qwen: {qwen_stats['throughput']:6.2f} req/s "
-            f"(avg {qwen_stats['avg_ms']:6.1f}ms, count={qwen_stats['count']}) | "
-            f"Total/frame: {total_stats['avg_ms']:6.1f}ms "
+            f"[Speed] Loop: {yolo_fr['frame_rate']:6.1f} frames/s "
+            f"| YOLO infer: {yolo_stats['avg_ms']:6.1f}ms "
+            f"(min={yolo_stats['min_ms']:.1f} max={yolo_stats['max_ms']:.1f}ms) "
+            f"| Stream: {stream_stats['mbps']:7.2f} MB/s "
+            f"| Qwen: {qwen_stats['throughput']:6.2f} req/s "
+            f"(avg {qwen_stats['avg_ms']:6.1f}ms, count={qwen_stats['count']}) "
+            f"| Total/frame: {total_stats['avg_ms']:6.1f}ms "
             f"(min={total_stats['min_ms']:.1f} max={total_stats['max_ms']:.1f}ms, "
             f"{total_stats['fps']:.1f} frames/s)"
         )
@@ -1495,7 +1514,7 @@ class Pipeline:
         logger.info(f"  行为统计: {summary['behavior_counts']}")
         logger.info(f"  告警次数: {summary['alert_count']}")
         logger.info(f"  处理模式: {'并发' if self.concurrent_mode else '级联'}")
-        logger.info(f"  YOLO: {yolo_fr['frame_rate']:.1f} frames/s (infer avg={yolo_stats['avg_ms']:.1f}ms min={yolo_stats['min_ms']:.1f} max={yolo_stats['max_ms']:.1f}ms, {yolo_stats['count']} 次)")
+        logger.info(f"  Loop: {yolo_fr['frame_rate']:.1f} frames/s | YOLO infer: avg={yolo_stats['avg_ms']:.1f}ms min={yolo_stats['min_ms']:.1f} max={yolo_stats['max_ms']:.1f}ms ({yolo_stats['count']} 次)")
         logger.info(f"  Stream: {stream_stats['mbps']:.2f} MB/s (total {stream_stats['total_mb']:.1f} MB, avg {stream_stats.get('avg_frame_kb', 0):.1f} KB/frame)")
         logger.info(f"  Qwen: {qwen_stats['throughput']:.2f} req/s (avg {qwen_stats['avg_ms']:.1f}ms, {qwen_stats['count']} 次)")
         logger.info(f"  Total/frame: avg={total_stats['avg_ms']:.1f}ms min={total_stats['min_ms']:.1f}ms max={total_stats['max_ms']:.1f}ms ({total_stats['fps']:.1f} frames/s, {total_stats['count']} 帧)")
