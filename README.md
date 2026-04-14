@@ -12,6 +12,7 @@
 - [安装依赖](#安装依赖)
 - [配置文件详解](#配置文件详解)
 - [运行方式](#运行方式)
+  - [视频文件运行示例](#6-视频文件运行示例)
 - [本地模型部署](#本地模型部署可选)
 - [微调 YOLO](#微调-yolo可选)
 - [性能监控](#性能监控)
@@ -481,7 +482,20 @@ ffplay rtsp://192.168.1.100:554/stream
 python main.py --source video --input video.mp4 --concurrent --max-concurrent 5
 ```
 
-### 6. 完整命令行参数
+### 6. 视频文件运行示例
+
+```bash
+# 水域救助场景
+python main.py --source video --input /media/ddc/新加卷/hys/hysnew/agent2/agent2/waterhelping_231125.mp4 --no-display
+
+# 危险行为场景
+python main.py --source video --input /media/ddc/新加卷/hys/qmy/agentold/danger_260327.mp4 --no-display
+
+# 溺水场景
+python main.py --source video --input /media/ddc/新加卷/hys/hysnew/agent2/agent2/drowning_240112.mp4 --no-display
+```
+
+### 7. 完整命令行参数
 
 ```bash
 python main.py \
